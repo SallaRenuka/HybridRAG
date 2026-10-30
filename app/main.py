@@ -147,7 +147,7 @@ def process_answer_and_citations(
     # If the response cites sources, but none were verified as supporting the claims:
     if not verified_citation_ids:
         # Check if the answer claimed facts without valid evidence
-        has_content = any(len(extract_claim_tokens(s)) >= 3 for s in sentences)
+        has_content = any(len(extract_claim_tokens(s)) >= 1 for s in sentences)
         if has_content:
             return INSUFFICIENT_INFO_MESSAGE, []
 
