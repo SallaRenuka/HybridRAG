@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+from datetime import datetime, timezone
 import re
 from typing import Sequence
 
@@ -8,8 +12,12 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
-from app.config import EMBEDDING_MODEL
+from app.config import EMBEDDING_MODEL, INDEX_DIR
 from app.ingest import Chunk
+
+INDEX_SCHEMA_VERSION = 1
+INDEX_METADATA_FILENAME = "metadata.json"
+FAISS_INDEX_FILENAME = "faiss.index"
 
 
 def tokenize(text: str) -> list[str]:
@@ -60,6 +68,104 @@ class HybridIndex:
 
         self.bm25 = BM25Okapi([tokenize(text) for text in texts])
         return len(self.chunks)
+
+    def save(self, directory: Path | str = INDEX_DIR) -> bool:
+        """Persist FAISS index and chunk metadata to disk safely using atomic file replacement."""
+        if self.faiss_index is None or not self.chunks:
+            return False
+
+        target_dir = Path(directory)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_file = target_dir / INDEX_METADATA_FILENAME
+        faiss_file = target_dir / FAISS_INDEX_FILENAME
+        tmp_meta_file = target_dir / f"{INDEX_METADATA_FILENAME}.tmp"
+        tmp_faiss_file = target_dir / f"{FAISS_INDEX_FILENAME}.tmp"
+
+        metadata = {
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "embedding_model": self.embedding_model_name,
+            "chunk_count": len(self.chunks),
+            "chunks": [c.to_dict() for c in self.chunks],
+        }
+
+        try:
+            # 1. Write FAISS index to temporary file
+            faiss.write_index(self.faiss_index, str(tmp_faiss_file))
+
+            # 2. Write metadata JSON to temporary file
+            with open(tmp_meta_file, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+            # 3. Atomically replace existing files with verified temp files
+            os.replace(str(tmp_faiss_file), str(faiss_file))
+            os.replace(str(tmp_meta_file), str(meta_file))
+            return True
+        except Exception as exc:
+            # Clean up temporary files on write failure
+            if tmp_faiss_file.exists():
+                tmp_faiss_file.unlink(missing_ok=True)
+            if tmp_meta_file.exists():
+                tmp_meta_file.unlink(missing_ok=True)
+            raise IOError(f"Failed to persist index to {target_dir}: {exc}") from exc
+
+    def load(self, directory: Path | str = INDEX_DIR) -> bool:
+        """Load persisted index and reconstruct BM25 safely without pickle deserialization."""
+        target_dir = Path(directory)
+        meta_file = target_dir / INDEX_METADATA_FILENAME
+        faiss_file = target_dir / FAISS_INDEX_FILENAME
+
+        if not meta_file.exists() or not faiss_file.exists():
+            return False
+
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            if not isinstance(metadata, dict):
+                return False
+
+            # Validate schema version
+            if metadata.get("schema_version") != INDEX_SCHEMA_VERSION:
+                return False
+
+            # Validate embedding model compatibility
+            if metadata.get("embedding_model") != self.embedding_model_name:
+                return False
+
+            raw_chunks = metadata.get("chunks")
+            if not isinstance(raw_chunks, list):
+                return False
+
+            chunks = [
+                Chunk(
+                    chunk_id=c["chunk_id"],
+                    text=c["text"],
+                    source=c["source"],
+                    page=c.get("page"),
+                )
+                for c in raw_chunks
+            ]
+
+            if len(chunks) != metadata.get("chunk_count"):
+                return False
+
+            # Read native FAISS binary index
+            loaded_faiss = faiss.read_index(str(faiss_file))
+            if loaded_faiss.ntotal != len(chunks):
+                return False
+
+            # Deterministically rebuild BM25Okapi from loaded chunks
+            texts = [c.text for c in chunks]
+            loaded_bm25 = BM25Okapi([tokenize(text) for text in texts])
+
+            self.chunks = chunks
+            self.faiss_index = loaded_faiss
+            self.bm25 = loaded_bm25
+            return True
+        except Exception:
+            return False
 
 
     def keyword_search(self, query: str, limit: int = 10) -> list[tuple[int, float]]:

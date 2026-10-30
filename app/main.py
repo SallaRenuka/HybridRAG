@@ -7,7 +7,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from app.config import UPLOAD_DIR
+from app.config import UPLOAD_DIR, INDEX_DIR
 from app.ingest import load_chunks
 from app.search_index import HybridIndex
 from app.retriever import Retriever
@@ -18,7 +18,12 @@ retriever = Retriever(index=index, use_reranker=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start quickly without loading large models until documents are indexed.
+    # Automatically load persisted index on startup if available
+    try:
+        if index.load(INDEX_DIR):
+            print(f"Loaded existing index with {len(index.chunks)} chunks from {INDEX_DIR}", flush=True)
+    except Exception as exc:
+        print(f"Failed to load existing index on startup: {exc}", flush=True)
     yield
 
 
@@ -58,7 +63,8 @@ def ingest() -> dict[str, Any]:
         )
     print(f"Loaded {len(chunks)} chunks. Starting embedding generation...", flush=True)
     count = index.build(chunks)
-    print("Embedding generation completed.", flush=True)
+    index.save(INDEX_DIR)
+    print(f"Embedding generation completed and index persisted ({count} chunks).", flush=True)
     return {
         "status": "indexed",
         "files_directory": str(UPLOAD_DIR),
