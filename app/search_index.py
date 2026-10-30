@@ -21,8 +21,9 @@ FAISS_INDEX_FILENAME = "faiss.index"
 
 
 def tokenize(text: str) -> list[str]:
-    # Keeps useful code identifiers and error codes together.
-    return re.findall(r"[A-Za-z0-9_./:-]+", text.lower())
+    # Keeps useful code identifiers and error codes together while stripping trailing sentence punctuation.
+    tokens = re.findall(r"[A-Za-z0-9_./:-]+", text.lower())
+    return [t.strip(".,;:!?") for t in tokens if t.strip(".,;:!?")]
 
 
 class HybridIndex:
