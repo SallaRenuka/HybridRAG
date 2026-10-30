@@ -30,7 +30,7 @@ class HybridIndex:
             self.model = SentenceTransformer(self.embedding_model_name, device="cpu")
         return self.model
 
-    def build(self, chunks: Sequence[Chunk]) -> int:
+    def build(self, chunks: Sequence[Chunk], batch_size: int = 32) -> int:
         self.chunks = list(chunks)
 
         if not self.chunks:
@@ -39,50 +39,26 @@ class HybridIndex:
             return 0
 
         texts = [c.text for c in self.chunks]
-        print("Total chunks:", len(texts), flush=True)
-        print("Invalid chunks:", sum(not isinstance(t, str) or not t.strip() for t in texts), flush=True)
-        print("Sample type:", type(texts[0]) if texts else "No chunks", flush=True)
-
-        print("Loading embedding model...", flush=True)
         model = self._get_model()
 
-        print("Generating embeddings...", flush=True)
-        print("First chunk:", repr(texts[0][:100]), flush=True)
-        print("Input type:", type(texts[0]), flush=True)
-
-
         import torch
-        torch.set_num_threads(1)
-        embeddings_list = []
+        # Guard against OpenMP threading crashes on macOS
+        if torch.get_num_threads() > 1:
+            torch.set_num_threads(1)
 
-        for i, text in enumerate(texts):
-            try:
-                embedding = model.encode(
-                    [text],
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                embeddings_list.append(embedding[0])
-
-            except Exception as exc:
-                print(f"Embedding failed at chunk {i}: {exc}", flush=True)
-                raise
-
-        embeddings = np.asarray(embeddings_list, dtype=np.float32)
-
-
-
+        embeddings = model.encode(
+            texts,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
         embeddings = np.asarray(embeddings, dtype=np.float32)
 
-        print("Building FAISS index...", flush=True)
         self.faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
         self.faiss_index.add(embeddings)
 
-        print("Building keyword index...", flush=True)
         self.bm25 = BM25Okapi([tokenize(text) for text in texts])
-
-        print("Index building completed.", flush=True)
         return len(self.chunks)
 
 
