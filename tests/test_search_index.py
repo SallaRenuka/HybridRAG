@@ -141,3 +141,30 @@ def test_load_incompatible_or_corrupt_metadata(tmp_path):
     with open(meta_file, "w") as f:
         json.dump({"schema_version": 1, "embedding_model": "different/model", "chunk_count": 1, "chunks": []}, f)
     assert fresh_idx.load(tmp_path) is False
+
+
+def test_pure_rrf_scoring_without_arbitrary_bonus():
+    # Chunk 0 has phrase match but lower ranks; Chunk 1 has higher rank
+    chunks = [
+        Chunk(chunk_id="c0", text="Exact phrase match query target inside some text.", source="a.txt", page=1),
+        Chunk(chunk_id="c1", text="Other relevant document without exact phrase.", source="b.txt", page=1),
+    ]
+    idx = HybridIndex()
+    idx.build(chunks)
+    res = idx.hybrid_search("exact phrase match query target", limit_each=2, rrf_k=60)
+    assert len(res) == 2
+    # Check that score calculation is exactly pure RRF: 1/(k+rank)
+    for item in res:
+        assert item["rrf_score"] <= (1.0 / 61.0 + 1.0 / 61.0)
+
+
+def test_empty_query_returns_empty_results():
+    chunks = [Chunk(chunk_id="c0", text="Sample document text.", source="a.txt", page=1)]
+    idx = HybridIndex()
+    idx.build(chunks)
+    assert idx.vector_search("") == []
+    assert idx.vector_search("   ") == []
+    assert idx.keyword_search("") == []
+    assert idx.keyword_search("   ") == []
+    assert idx.hybrid_search("") == []
+    assert idx.hybrid_search("   ") == []

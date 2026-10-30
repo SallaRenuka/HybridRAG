@@ -169,14 +169,17 @@ class HybridIndex:
 
 
     def keyword_search(self, query: str, limit: int = 10) -> list[tuple[int, float]]:
-        if self.bm25 is None or not self.chunks:
+        if self.bm25 is None or not self.chunks or not query.strip():
             return []
-        scores = self.bm25.get_scores(tokenize(query))
+        tokens = tokenize(query)
+        if not tokens:
+            return []
+        scores = self.bm25.get_scores(tokens)
         ranked = np.argsort(scores)[::-1]
         return [(int(i), float(scores[i])) for i in ranked[:limit] if scores[i] > 0]
 
     def vector_search(self, query: str, limit: int = 10) -> list[tuple[int, float]]:
-        if self.faiss_index is None:
+        if self.faiss_index is None or not self.chunks or not query.strip():
             return []
 
         model = self._get_model()
@@ -203,35 +206,18 @@ class HybridIndex:
             limit_each: int = 10,
             rrf_k: int = 60,
     ) -> list[dict]:
+        if not query.strip():
+            return []
+
         vector = self.vector_search(query, limit_each)
         keyword = self.keyword_search(query, limit_each)
 
         fused: dict[int, float] = {}
 
-        # Combine vector and keyword rankings using RRF.
+        # Pure Reciprocal Rank Fusion across vector and keyword rankings
         for ranked_list in (vector, keyword):
             for rank, (idx, _score) in enumerate(ranked_list, start=1):
-                chunk_text = self.chunks[idx].text.lower()
-
-                # Skip table-of-contents chunks.
-                if (
-                        "index" in chunk_text[:100]
-                        and "page no." in chunk_text
-                        and "introduction" in chunk_text
-                        and "references" in chunk_text
-                ):
-                    continue
-
                 fused[idx] = fused.get(idx, 0.0) + 1.0 / (rrf_k + rank)
-
-        # Give a small bonus to chunks containing the complete query phrase.
-        query_phrase = " ".join(tokenize(query))
-        if query_phrase:
-            for idx in list(fused):
-                chunk_text = " ".join(tokenize(self.chunks[idx].text))
-
-                if query_phrase in chunk_text:
-                    fused[idx] += 0.02
 
         ordered = sorted(
             fused.items(),
