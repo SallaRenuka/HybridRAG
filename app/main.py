@@ -16,6 +16,11 @@ from app.retriever import Retriever
 
 INSUFFICIENT_INFO_MESSAGE = "I could not find sufficient information in the uploaded documents."
 
+NEGATION_WORDS = {
+    "not", "never", "no", "cannot", "n't", "neither", "nor",
+    "incompatible", "unsupported", "without", "disables", "prohibits", "rejects"
+}
+
 STOP_WORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
     "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
@@ -83,14 +88,46 @@ def extract_claim_tokens(text: str) -> set[str]:
     return {t for t in tokens if t not in STOP_WORDS and len(t) > 1}
 
 
-def verify_claim_support(claim_sentence: str, chunk_text: str, min_overlap: float = 0.35) -> bool:
-    """Validate whether the cited chunk text actually contains evidence supporting the claim sentence."""
+def check_sentence_support_and_consistency(
+    claim_sentence: str,
+    chunk_text: str,
+    min_overlap: float = 0.35,
+) -> bool:
+    """Verify semantic support and check for negation polarity contradictions between claim and source."""
     claim_tokens = extract_claim_tokens(claim_sentence)
     if not claim_tokens:
         return True
-    chunk_tokens = set(tokenize(chunk_text))
-    overlap = len(claim_tokens & chunk_tokens) / len(claim_tokens)
-    return overlap >= min_overlap
+
+    # Split chunk into sentences to locate the exact supporting sentence
+    chunk_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", chunk_text) if s.strip()]
+    if not chunk_sentences:
+        chunk_sentences = [chunk_text]
+
+    best_overlap = 0.0
+    best_matching_sent = ""
+
+    for c_sent in chunk_sentences:
+        c_tokens = set(tokenize(c_sent))
+        overlap = len(claim_tokens & c_tokens) / len(claim_tokens)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_matching_sent = c_sent
+
+    # If even the best matching sentence does not meet minimum content overlap, reject
+    if best_overlap < min_overlap:
+        return False
+
+    # Check for negation polarity contradiction between claim and matching chunk sentence
+    claim_has_neg = bool(set(tokenize(claim_sentence)) & NEGATION_WORDS)
+    match_has_neg = bool(set(tokenize(best_matching_sent)) & NEGATION_WORDS)
+    if claim_has_neg != match_has_neg:
+        return False
+
+    return True
+
+
+# Alias for backwards compatibility
+verify_claim_support = check_sentence_support_and_consistency
 
 
 def format_context_and_citation_map(
@@ -123,41 +160,74 @@ def process_answer_and_citations(
     raw_answer: str,
     citation_map: dict[int, Citation],
 ) -> tuple[str, list[Citation]]:
-    """Extract inline citations, verify claim evidence against source text, and prune unsupported sources."""
+    """Validate every sentence in the response. Remove unsupported claims and invalid citation IDs.
+    
+    Ensures every factual claim has verified evidence. If no verified sentences remain,
+    safely returns the insufficient-information fallback with cleared citations.
+    """
     if not raw_answer or INSUFFICIENT_INFO_MESSAGE.lower() in raw_answer.lower():
         return INSUFFICIENT_INFO_MESSAGE, []
 
-    # Split response into sentence units for claim-level verification
+    # Split response into sentence units for sentence-level verification
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_answer) if s.strip()]
+    if not sentences:
+        return INSUFFICIENT_INFO_MESSAGE, []
 
+    verified_sentences: list[str] = []
     verified_citation_ids: set[int] = set()
 
     for sent in sentences:
-        cited_indices = [int(m) for m in re.findall(r"\[(\d+)\]", sent)]
-        for cit_id in cited_indices:
-            # Reject invalid or out-of-range citation IDs (e.g. [99])
-            if cit_id not in citation_map:
-                continue
+        all_cited_raw = re.findall(r"\[(\d+)\]", sent)
+        cited_indices = [int(m) for m in all_cited_raw]
 
-            # Verify that the chunk actually provides evidence for this claim
-            target_chunk = citation_map[cit_id]
-            if verify_claim_support(sent, target_chunk.text):
-                verified_citation_ids.add(cit_id)
+        claim_tokens = extract_claim_tokens(sent)
+        is_factual = len(claim_tokens) >= 2
 
-    # If the response cites sources, but none were verified as supporting the claims:
-    if not verified_citation_ids:
-        # Check if the answer claimed facts without valid evidence
-        has_content = any(len(extract_claim_tokens(s)) >= 1 for s in sentences)
-        if has_content:
-            return INSUFFICIENT_INFO_MESSAGE, []
+        # Every factual sentence MUST have at least one citation
+        if is_factual and not cited_indices:
+            continue
 
-    # Return only the verified citations, strictly ordered by citation ID
+        # Check for valid citation IDs present in context
+        valid_indices = [cid for cid in cited_indices if cid in citation_map]
+        if not valid_indices:
+            continue
+
+        # Verify semantic evidence support across the valid cited chunks
+        sentence_verified_ids = []
+        for cid in valid_indices:
+            target_chunk = citation_map[cid]
+            if check_sentence_support_and_consistency(sent, target_chunk.text):
+                sentence_verified_ids.append(cid)
+
+        if not sentence_verified_ids:
+            # Claim failed evidence verification or is a contradiction -> drop sentence
+            continue
+
+        # Clean sentence so NO invalid or unverified citation IDs remain
+        cleaned_text = re.sub(r"\s*\[\d+\]", "", sent).strip()
+        tags = "".join(f"[{cid}]" for cid in sorted(set(sentence_verified_ids)))
+        if cleaned_text.endswith((".", "!", "?")):
+            cleaned_sent = f"{cleaned_text[:-1].rstrip()} {tags}{cleaned_text[-1]}"
+        else:
+            cleaned_sent = f"{cleaned_text.rstrip()} {tags}."
+
+        verified_sentences.append(cleaned_sent)
+        verified_citation_ids.update(sentence_verified_ids)
+
+    # If no sentences passed verification, safely return fallback
+    if not verified_sentences or not verified_citation_ids:
+        return INSUFFICIENT_INFO_MESSAGE, []
+
+    # Reconstruct answer strictly from verified sentences
+    final_answer = " ".join(verified_sentences)
+
+    # Return structured citations for ONLY verified chunks, ordered by citation ID
     final_citations = [
         citation_map[cid]
         for cid in sorted(verified_citation_ids)
     ]
 
-    return raw_answer, final_citations
+    return final_answer, final_citations
 
 
 def call_ollama(prompt: str, model_name: str = "llama3.2:3b", timeout: int = 120) -> str:

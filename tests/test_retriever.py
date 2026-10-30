@@ -105,3 +105,27 @@ def test_retrieve_with_mocked_reranker():
     assert results[0]["rerank_score"] == 7.8
     assert results[1]["chunk"].chunk_id == "c1"
     assert results[1]["rerank_score"] == 1.2
+
+
+def test_reranker_failure_fallback_to_rrf():
+    mock_index = MagicMock()
+    c1 = Chunk(chunk_id="c1", text="Top RRF ranked chunk.", source="a.txt", page=1)
+    c2 = Chunk(chunk_id="c2", text="Second RRF ranked chunk.", source="b.txt", page=1)
+    mock_index.hybrid_search.return_value = [
+        {"chunk": c1, "rrf_score": 0.035},
+        {"chunk": c2, "rrf_score": 0.015},
+    ]
+
+    retriever = Retriever(index=mock_index, use_reranker=True)
+    mock_model = MagicMock()
+    # Simulate runtime exception in CrossEncoder (e.g. CUDA OOM or device failure)
+    mock_model.predict.side_effect = RuntimeError("Simulated device failure in CrossEncoder")
+    retriever._reranker = mock_model
+
+    # Must NOT crash! Must gracefully fall back to RRF rankings
+    results = retriever.retrieve("Any question", top_k=2)
+    assert len(results) == 2
+    assert results[0]["chunk"].chunk_id == "c1"
+    assert results[0]["rrf_score"] == 0.035
+    assert results[1]["chunk"].chunk_id == "c2"
+    assert results[1]["rrf_score"] == 0.015

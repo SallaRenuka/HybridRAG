@@ -101,3 +101,79 @@ def test_process_answer_and_citations_rejects_hallucinated_claim():
     # Verification fails on claim evidence -> fallback triggered!
     assert ans == INSUFFICIENT_INFO_MESSAGE
     assert citations == []
+
+
+def test_one_supported_sentence_followed_by_unsupported_sentence():
+    c1 = Chunk(chunk_id="c1", text="FastAPI is an asynchronous web framework for Python.", source="fastapi.txt", page=1)
+    cit_map = {1: Citation(id=1, source="fastapi.txt", chunk_id="c1", page=1, text=c1.text)}
+
+    # Sentence 1 is supported by chunk 1. Sentence 2 is an unsupported hallucination.
+    raw_answer = "FastAPI is an asynchronous web framework for Python [1]. It was created by Isaac Newton in 1687 [1]."
+    ans, citations = process_answer_and_citations(raw_answer, cit_map)
+
+    # Unsupported sentence MUST be dropped, leaving only the verified sentence!
+    assert "Isaac Newton" not in ans
+    assert "FastAPI is an asynchronous web framework for Python [1]." in ans
+    assert len(citations) == 1
+    assert citations[0].id == 1
+
+
+def test_valid_and_invalid_citation_ids_in_same_sentence():
+    c1 = Chunk(chunk_id="c1", text="FAISS handles similarity search of dense vectors.", source="faiss.txt", page=1)
+    cit_map = {1: Citation(id=1, source="faiss.txt", chunk_id="c1", page=1, text=c1.text)}
+
+    # Sentence cites valid [1] and invalid [99] in the same sentence
+    raw_answer = "FAISS handles similarity search of dense vectors [1][99]."
+    ans, citations = process_answer_and_citations(raw_answer, cit_map)
+
+    # Invalid citation [99] MUST be purged; valid citation [1] retained
+    assert "[99]" not in ans
+    assert "[1]" in ans
+    assert len(citations) == 1
+    assert citations[0].id == 1
+
+
+def test_multiple_claims_supported_by_different_chunks():
+    c1 = Chunk(chunk_id="c1", text="FastAPI provides high performance routing.", source="fastapi.txt", page=1)
+    c2 = Chunk(chunk_id="c2", text="PostgreSQL manages persistent relational database tables.", source="db.txt", page=None)
+    cit_map = {
+        1: Citation(id=1, source="fastapi.txt", chunk_id="c1", page=1, text=c1.text),
+        2: Citation(id=2, source="db.txt", chunk_id="c2", page=None, text=c2.text),
+    }
+
+    raw_answer = (
+        "FastAPI provides high performance routing [1]. "
+        "PostgreSQL manages persistent relational database tables [2]."
+    )
+    ans, citations = process_answer_and_citations(raw_answer, cit_map)
+
+    assert "FastAPI provides high performance routing [1]." in ans
+    assert "PostgreSQL manages persistent relational database tables [2]." in ans
+    assert len(citations) == 2
+    assert {c.id for c in citations} == {1, 2}
+
+
+def test_contradictory_claim_with_similar_keywords_rejected():
+    c1 = Chunk(chunk_id="c1", text="FastAPI is not compatible with Python 2. It requires Python 3.8 or higher.", source="py.txt", page=1)
+    cit_map = {1: Citation(id=1, source="py.txt", chunk_id="c1", page=1, text=c1.text)}
+
+    # Claim shares keywords (FastAPI, compatible, Python 2) but is a direct contradiction of the source!
+    contradictory_answer = "FastAPI is compatible with Python 2 [1]."
+    ans, citations = process_answer_and_citations(contradictory_answer, cit_map)
+
+    # Contradiction MUST be rejected -> returns insufficient info fallback!
+    assert ans == INSUFFICIENT_INFO_MESSAGE
+    assert citations == []
+
+
+def test_answer_with_factual_claims_but_no_citations_rejected():
+    c1 = Chunk(chunk_id="c1", text="FastAPI is an asynchronous framework.", source="doc.txt", page=1)
+    cit_map = {1: Citation(id=1, source="doc.txt", chunk_id="c1", page=1, text=c1.text)}
+
+    # Answer makes factual claims without citing any sources
+    uncited_answer = "FastAPI is an asynchronous framework. It provides high performance routing."
+    ans, citations = process_answer_and_citations(uncited_answer, cit_map)
+
+    # Factual claims without citations must NOT be passed as verified facts!
+    assert ans == INSUFFICIENT_INFO_MESSAGE
+    assert citations == []
