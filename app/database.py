@@ -313,6 +313,15 @@ class Database:
                 created_at=now,
             )
 
+    def delete_conversation(self, conversation_id: int, user_id: int) -> bool:
+        """Delete a conversation and all its messages strictly enforcing user ownership."""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM chat_conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            )
+            return cursor.rowcount > 0
+
     def get_messages_for_conversation(self, conversation_id: int, user_id: int) -> list[MessageRecord]:
         """Fetch all messages for conversation strictly verifying user ownership."""
         conv = self.get_conversation_by_id(conversation_id, user_id)
@@ -335,3 +344,33 @@ class Database:
                 )
                 for row in rows
             ]
+
+    # ------------------ Analytics & Aggregation ------------------
+    def get_user_stats(self, user_id: int) -> dict[str, Any]:
+        """Aggregate real-time metrics strictly for the authenticated user."""
+        with self.get_connection() as conn:
+            doc_stats = conn.execute(
+                "SELECT COUNT(*) as count, COALESCE(SUM(file_size_bytes), 0) as total_size, COALESCE(SUM(chunk_count), 0) as total_chunks FROM documents WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            conv_count = conn.execute(
+                "SELECT COUNT(*) as count FROM chat_conversations WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            msg_count = conn.execute(
+                "SELECT COUNT(*) as count FROM chat_messages WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            user_questions_count = conn.execute(
+                "SELECT COUNT(*) as count FROM chat_messages WHERE user_id = ? AND role = 'user'",
+                (user_id,),
+            ).fetchone()["count"]
+
+            return {
+                "total_documents": int(doc_stats["count"]),
+                "total_size_bytes": int(doc_stats["total_size"]),
+                "total_chunks": int(doc_stats["total_chunks"]),
+                "total_conversations": int(conv_count),
+                "total_messages": int(msg_count),
+                "total_questions_asked": int(user_questions_count),
+            }

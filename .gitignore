@@ -9,3 +9,35 @@ data/users/*
 *.sqlite
 *.sqlite3
 .DS_Store
+
+# Python
+*.py[cod]
+*$py.class
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
+# Environment files
+.env.*
+!.env.example
+
+# Local data and generated indexes
+data/*.db
+data/*.sqlite*
+data/uploads/
+data/index/
+data/users/
+
+# OS files
+.DS_Store

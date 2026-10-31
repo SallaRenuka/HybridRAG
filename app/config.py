@@ -1,6 +1,19 @@
 import os
 from pathlib import Path
 
+# Enforce stable offline loading and single-threaded PyTorch execution to prevent macOS OpenMP race conditions
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+try:
+    import torch
+    torch.set_num_threads(1)
+except ImportError:
+    pass
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"

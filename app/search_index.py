@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 import re
@@ -26,18 +27,30 @@ def tokenize(text: str) -> list[str]:
     return [t.strip(".,;:!?") for t in tokens if t.strip(".,;:!?")]
 
 
+_SHARED_EMBEDDING_MODELS: dict[str, SentenceTransformer] = {}
+_MODEL_LOCK = threading.Lock()
+_EMBED_INFERENCE_LOCK = threading.Lock()
+
+
 class HybridIndex:
     def __init__(self, embedding_model: str = EMBEDDING_MODEL):
         self.embedding_model_name = embedding_model
-        self.model: SentenceTransformer | None = None
         self.chunks: list[Chunk] = []
         self.faiss_index = None
         self.bm25 = None
 
     def _get_model(self) -> SentenceTransformer:
-        if self.model is None:
-            self.model = SentenceTransformer(self.embedding_model_name, device="cpu")
-        return self.model
+        with _MODEL_LOCK:
+            if self.embedding_model_name not in _SHARED_EMBEDDING_MODELS:
+                try:
+                    _SHARED_EMBEDDING_MODELS[self.embedding_model_name] = SentenceTransformer(
+                        self.embedding_model_name, device="cpu", local_files_only=True
+                    )
+                except Exception:
+                    _SHARED_EMBEDDING_MODELS[self.embedding_model_name] = SentenceTransformer(
+                        self.embedding_model_name, device="cpu"
+                    )
+            return _SHARED_EMBEDDING_MODELS[self.embedding_model_name]
 
     def build(self, chunks: Sequence[Chunk], batch_size: int = 32) -> int:
         self.chunks = list(chunks)
@@ -51,17 +64,17 @@ class HybridIndex:
         model = self._get_model()
 
         import torch
-        # Guard against OpenMP threading crashes on macOS
         if torch.get_num_threads() > 1:
             torch.set_num_threads(1)
 
-        embeddings = model.encode(
-            texts,
-            batch_size=batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        with _EMBED_INFERENCE_LOCK:
+            embeddings = model.encode(
+                texts,
+                batch_size=batch_size,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         embeddings = np.asarray(embeddings, dtype=np.float32)
 
         self.faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
@@ -169,6 +182,26 @@ class HybridIndex:
             return False
 
 
+    def exact_identifier_search(self, query: str, limit: int = 10) -> list[tuple[int, float]]:
+        if not self.chunks or not query.strip():
+            return []
+        ids = re.findall(r"\b([A-Za-z]{2,5}\d{2,6})\b", query, re.IGNORECASE)
+        if not ids:
+            return []
+
+        matches: list[tuple[int, float]] = []
+        for idx, chunk in enumerate(self.chunks):
+            match_count = 0
+            for entity_id in ids:
+                pattern = r"\b" + re.escape(entity_id) + r"\b"
+                if re.search(pattern, chunk.text, re.IGNORECASE):
+                    match_count += 1
+            if match_count > 0:
+                matches.append((idx, float(match_count)))
+
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches[:limit]
+
     def keyword_search(self, query: str, limit: int = 10) -> list[tuple[int, float]]:
         if self.bm25 is None or not self.chunks or not query.strip():
             return []
@@ -184,12 +217,13 @@ class HybridIndex:
             return []
 
         model = self._get_model()
-        embedding = model.encode(
-            [query],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        with _EMBED_INFERENCE_LOCK:
+            embedding = model.encode(
+                [query],
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         embedding = np.asarray(embedding, dtype=np.float32)
 
         k = min(limit, len(self.chunks))
@@ -210,13 +244,14 @@ class HybridIndex:
         if not query.strip():
             return []
 
+        exact = self.exact_identifier_search(query, limit_each)
         vector = self.vector_search(query, limit_each)
         keyword = self.keyword_search(query, limit_each)
 
         fused: dict[int, float] = {}
 
-        # Pure Reciprocal Rank Fusion across vector and keyword rankings
-        for ranked_list in (vector, keyword):
+        # Reciprocal Rank Fusion across exact identifier matches, vector, and keyword rankings
+        for ranked_list in (exact, vector, keyword):
             for rank, (idx, _score) in enumerate(ranked_list, start=1):
                 fused[idx] = fused.get(idx, 0.0) + 1.0 / (rrf_k + rank)
 

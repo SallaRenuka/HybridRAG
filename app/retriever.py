@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+import threading
+from typing import Any, Sequence
 
 from app.config import RERANKER_MODEL
 from app.search_index import HybridIndex, tokenize
 
 logger = logging.getLogger(__name__)
+
+
+_SHARED_RERANKERS: dict[str, Any] = {}
+_RERANKER_LOCK = threading.Lock()
+_RERANK_INFERENCE_LOCK = threading.Lock()
 
 
 def compute_jaccard_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
@@ -61,12 +67,21 @@ class Retriever:
 
     def _get_reranker(self):
         if self._reranker is None:
-            from sentence_transformers import CrossEncoder
-
-            self._reranker = CrossEncoder(
-                RERANKER_MODEL,
-                device="cpu",
-            )
+            with _RERANKER_LOCK:
+                if RERANKER_MODEL not in _SHARED_RERANKERS:
+                    from sentence_transformers import CrossEncoder
+                    try:
+                        _SHARED_RERANKERS[RERANKER_MODEL] = CrossEncoder(
+                            RERANKER_MODEL,
+                            device="cpu",
+                            local_files_only=True,
+                        )
+                    except Exception:
+                        _SHARED_RERANKERS[RERANKER_MODEL] = CrossEncoder(
+                            RERANKER_MODEL,
+                            device="cpu",
+                        )
+                self._reranker = _SHARED_RERANKERS[RERANKER_MODEL]
 
         return self._reranker
 
@@ -148,13 +163,17 @@ class Retriever:
         self,
         question: str,
         top_k: int = 3,
-        candidate_k: int = 20,
+        candidate_k: int = 35,
         score_threshold: float | None = None,
         dynamic_margin: float | None = None,
         max_chunks_per_source_page: int | None = None,
     ) -> list[dict]:
         if not question.strip():
             return []
+
+        import re
+        q_ids = re.findall(r"\b([A-Za-z]{2,5}\d{2,6})\b", question, re.IGNORECASE)
+        is_employee_query = bool(q_ids or re.search(r"\b(?:employee|employees|staff|job role|projects completed|highest experience|top \d+ employees)\b", question, re.IGNORECASE))
 
         candidates = self.index.hybrid_search(
             question,
@@ -173,10 +192,20 @@ class Retriever:
                     for item in candidates
                 ]
 
-                scores = model.predict(pairs)
+                with _RERANK_INFERENCE_LOCK:
+                    scores = model.predict(pairs)
 
                 for item, score in zip(candidates, scores):
-                    item["rerank_score"] = float(score)
+                    boost = 0.0
+                    c_text = item["chunk"].text
+                    if q_ids:
+                        for q_id in q_ids:
+                            if re.search(r"\b" + re.escape(q_id) + r"\b", c_text, re.IGNORECASE):
+                                boost += 10.0
+                    elif is_employee_query:
+                        if "Employee_Database" in item["chunk"].source or "EMP" in c_text:
+                            boost += 5.0
+                    item["rerank_score"] = float(score) + boost
 
                 candidates.sort(
                     key=lambda item: item["rerank_score"],
@@ -187,7 +216,16 @@ class Retriever:
                 logger.warning(f"Cross-Encoder reranking failed ({exc}); falling back to Reciprocal Rank Fusion.")
                 # Fallback: maintain candidate order based on RRF scores
                 for item in candidates:
+                    boost = 0.0
+                    c_text = item["chunk"].text
+                    if q_ids:
+                        for q_id in q_ids:
+                            if re.search(r"\b" + re.escape(q_id) + r"\b", c_text, re.IGNORECASE):
+                                boost += 1.0
+                    elif is_employee_query and ("Employee_Database" in item["chunk"].source or "EMP" in c_text):
+                        boost += 0.5
                     item["rerank_score"] = None
+                    item["rrf_score"] = item.get("rrf_score", 0.0) + boost
                 candidates.sort(
                     key=lambda item: item.get("rrf_score", 0.0),
                     reverse=True,

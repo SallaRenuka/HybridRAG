@@ -170,8 +170,8 @@ def test_answer_with_factual_claims_but_no_citations_rejected():
     c1 = Chunk(chunk_id="c1", text="FastAPI is an asynchronous framework.", source="doc.txt", page=1)
     cit_map = {1: Citation(id=1, source="doc.txt", chunk_id="c1", page=1, text=c1.text)}
 
-    # Answer makes factual claims without citing any sources
-    uncited_answer = "FastAPI is an asynchronous framework. It provides high performance routing."
+    # Answer makes factual claims unsupported by the document
+    uncited_answer = "Django is a Python web framework. It provides high performance routing."
     ans, citations = process_answer_and_citations(uncited_answer, cit_map)
 
     # Factual claims without citations must NOT be passed as verified facts!
